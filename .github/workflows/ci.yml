@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Fast gate: everything that needs nothing outside node_modules.
+  unit:
+    name: lint, typecheck, unit tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run format:check
+      - run: npm test
+      # Proves the built dist/ loads as both ESM and CJS, and that the core
+      # entry point does not need the optional better-sqlite3 peer dependency.
+      - run: npm run test:package
+
+  # The interoperability matrix, against the native sqlite3 shell.
+  integration:
+    name: interop with the sqlite3 shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Install the sqlite3 shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+          sqlite3 --version
+      - name: Run integration tests
+        env:
+          # Turns "sqlite3 not installed" into a hard failure, so the suite can
+          # never silently no-op in CI.
+          SQLITE_TEST_REQUIRED: '1'
+          KEEP_TEST_OUTPUT: '1'
+        run: npm run test:integration
+      - name: Upload dump artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dumps
+          path: test-output/
+          if-no-files-found: ignore
