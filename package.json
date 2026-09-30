@@ -1,0 +1,89 @@
+{
+  "name": "dbgate-sqlite-dumper",
+  "version": "0.1.0",
+  "description": "Standalone, client-agnostic SQLite SQL dump and restore library for Node.js, compatible with the native sqlite3 .dump command",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dbgate/dbgate-sqlite-dumper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dbgate/dbgate-sqlite-dumper/issues"
+  },
+  "homepage": "https://github.com/dbgate/dbgate-sqlite-dumper#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist",
+    "docs"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./better-sqlite3": {
+      "types": "./dist/better-sqlite3.d.ts",
+      "import": "./dist/better-sqlite3.js",
+      "require": "./dist/better-sqlite3.cjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "clean": "tsup --clean",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings 0",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build && node scripts/smoke.mjs",
+    "test": "vitest run",
+    "test:all": "npm run test && npm run test:integration",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:package": "npm run build && node scripts/smoke.mjs",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "sqlite",
+    "sqlite3",
+    "dump",
+    ".dump",
+    "sql",
+    "backup",
+    "restore",
+    "database",
+    "better-sqlite3"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=9.0.0"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.25.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.3",
+    "better-sqlite3": "^12.2.0",
+    "eslint": "^9.25.1",
+    "prettier": "^3.5.3",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.31.0",
+    "vitest": "^3.1.2"
+  }
+}
