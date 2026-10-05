@@ -1,5 +1,6 @@
 import type { SqliteColumnValue, SqliteRow } from '../connection/types.js';
 import { isUtf8 } from 'node:buffer';
+import { toBuffer } from '../connection/acquire.js';
 import { renderBlobLiteral, renderTextLiteral } from '../security/literals.js';
 import type { TextLiteralStyle } from '../security/literals.js';
 
@@ -38,6 +39,31 @@ function realLiteralExpression(column: string): string {
 }
 
 /**
+ * How the bytes of text and blob values travel from SQLite to this package.
+ *
+ * Natively they arrive as bytes. Over a transport that cannot carry bytes
+ * exactly — JSON, for Cloudflare D1 — SQLite is asked for their `hex()`
+ * instead, which any transport carries as plain ASCII text.
+ */
+export interface SqliteValueTransport {
+  /** Text values (in a UTF-8 database) are read as `hex()` of their bytes. */
+  readonly hexText: boolean;
+  /** Blob values are read as `hex()`. */
+  readonly hexBlob: boolean;
+}
+
+export const NATIVE_VALUE_TRANSPORT: SqliteValueTransport = { hexText: false, hexBlob: false };
+
+export function valueTransport(
+  utf8Database: boolean,
+  binaryTransport: 'native' | 'hex',
+): SqliteValueTransport {
+  return binaryTransport === 'hex'
+    ? { hexText: utf8Database, hexBlob: true }
+    : NATIVE_VALUE_TRANSPORT;
+}
+
+/**
  * The select-list for one column: its storage class, and a value shaped so
  * that only exact representations cross the driver boundary.
  *
@@ -50,25 +76,35 @@ function realLiteralExpression(column: string): string {
  *   read as text instead and the driver's (lossless, for valid UTF-16)
  *   conversion is used;
  * - `BLOB` → the bytes; `NULL` → `NULL`.
+ *
+ * With a hex {@link SqliteValueTransport}, text and blob bytes are read as
+ * `hex()` text instead.
  */
-export function columnValueSelect(column: string, index: number, utf8Database: boolean): string {
-  const textBranch = utf8Database ? `CAST(${column} AS BLOB)` : column;
+export function columnValueSelect(
+  column: string,
+  index: number,
+  utf8Database: boolean,
+  transport: SqliteValueTransport = NATIVE_VALUE_TRANSPORT,
+): string {
+  const textBytes = utf8Database ? `CAST(${column} AS BLOB)` : column;
+  const textBranch = transport.hexText ? `hex(${textBytes})` : textBytes;
   return (
     `typeof(${column}) AS "t${index}", ` +
     `CASE typeof(${column}) ` +
     `WHEN 'integer' THEN CAST(${column} AS TEXT) ` +
     `WHEN 'real' THEN ${realLiteralExpression(column)} ` +
     `WHEN 'text' THEN ${textBranch} ` +
+    (transport.hexBlob ? `WHEN 'blob' THEN hex(${column}) ` : '') +
     `ELSE ${column} END AS "v${index}"`
   );
 }
 
-function asBytes(value: SqliteColumnValue): Buffer {
-  if (Buffer.isBuffer(value)) {
-    return value;
+function asBytes(value: SqliteColumnValue, hex: boolean): Buffer {
+  if (typeof value === 'string') {
+    return Buffer.from(value, hex ? 'hex' : 'utf8');
   }
-  if (value instanceof Uint8Array) {
-    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer || Array.isArray(value)) {
+    return toBuffer(value as Uint8Array | ArrayBuffer | readonly number[]);
   }
   return Buffer.from(String(value), 'utf8');
 }
@@ -86,6 +122,7 @@ export function renderColumnLiteral(
   row: SqliteRow,
   index: number,
   textStyle: TextLiteralStyle,
+  transport: SqliteValueTransport = NATIVE_VALUE_TRANSPORT,
 ): string | Buffer {
   const storageClass = row[`t${index}`];
   const value = row[`v${index}`] ?? null;
@@ -94,10 +131,10 @@ export function renderColumnLiteral(
     case 'real':
       return String(value);
     case 'text': {
-      if (typeof value === 'string') {
+      if (typeof value === 'string' && !transport.hexText) {
         return renderTextLiteral(value, textStyle);
       }
-      const bytes = asBytes(value);
+      const bytes = asBytes(value, transport.hexText);
       if (isUtf8(bytes)) {
         return renderTextLiteral(bytes.toString('utf8'), textStyle);
       }
@@ -106,7 +143,7 @@ export function renderColumnLiteral(
       return Buffer.from(renderTextLiteral(bytes.toString('latin1'), textStyle), 'latin1');
     }
     case 'blob':
-      return renderBlobLiteral(asBytes(value));
+      return renderBlobLiteral(asBytes(value, transport.hexBlob));
     default:
       return 'NULL';
   }

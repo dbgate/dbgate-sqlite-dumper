@@ -35,7 +35,19 @@ target's module list is known — missing virtual-table modules.
 An encrypted database (SQLCipher, SEE) dumps as plain SQL once it is opened with its key.
 The dump is not encrypted, and no key is ever written into it or into any diagnostic.
 
+### Restoring into Cloudflare D1
+
+The D1 adapter dumps only. D1 refuses the transaction and `writable_schema` statements a
+dump script contains; see [d1-adapter.md](d1-adapter.md) for loading a dump with
+`wrangler`.
+
 ## Behaviours to know about
+
+### A D1 dump is not a snapshot
+
+D1 has no client transactions, so a dump of a database that is written to meanwhile may be
+partly inconsistent. It is reported as `snapshot-unavailable`; see
+[d1-adapter.md](d1-adapter.md#consistency).
 
 ### `REAL` digits depend on the SQLite release
 

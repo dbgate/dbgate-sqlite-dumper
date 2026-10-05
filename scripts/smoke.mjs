@@ -41,6 +41,9 @@ for (const file of [
   'dist/better-sqlite3.js',
   'dist/better-sqlite3.cjs',
   'dist/better-sqlite3.d.ts',
+  'dist/d1.js',
+  'dist/d1.cjs',
+  'dist/d1.d.ts',
 ]) {
   check(`${file} exists`, existsSync(join(root, file)));
 }
@@ -75,6 +78,18 @@ check('exports fromBetterSqlite3', typeof adapterEsm.fromBetterSqlite3 === 'func
 check('exports connectBetterSqlite3', typeof adapterEsm.connectBetterSqlite3 === 'function');
 const adapterCjs = require(join(root, 'dist/better-sqlite3.cjs'));
 check('CJS exports fromBetterSqlite3', typeof adapterCjs.fromBetterSqlite3 === 'function');
+
+section('Cloudflare D1 adapter entry point');
+const d1Esm = await import(new URL('../dist/d1.js', import.meta.url).href);
+check('exports fromD1Http', typeof d1Esm.fromD1Http === 'function');
+check('exports fromD1Binding', typeof d1Esm.fromD1Binding === 'function');
+const d1Cjs = require(join(root, 'dist/d1.cjs'));
+check('CJS exports fromD1Http', typeof d1Cjs.fromD1Http === 'function');
+check(
+  'declares the D1 restrictions',
+  d1Esm.fromD1Http({ accountId: 'a', databaseId: 'd', apiToken: 't', fetch: async () => {} })
+    .features.transactions === false,
+);
 
 section('behaviour without a database');
 const statements = esm.parseSqlStatements(

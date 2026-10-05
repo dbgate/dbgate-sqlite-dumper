@@ -1,5 +1,5 @@
 import type { SqliteConnection } from '../connection/types.js';
-import type { SqliteTable } from '../model/database.js';
+import type { SqliteIndex, SqliteTable } from '../model/database.js';
 import type { SqliteDiagnostic } from '../model/diagnostics.js';
 import type { DumpProgressCallback } from '../utils/progress.js';
 import type { DumpWriter } from '../writer/types.js';
@@ -64,6 +64,13 @@ export interface TableDataExportRequest {
    * `ArchiveEntry.systemRowFilter`.
    */
   readonly systemRowFilter?: readonly string[];
+  /**
+   * The table's primary-key index (`origin` `pk`), for a `WITHOUT ROWID`
+   * table read in pages: it gives the key order — direction and collation
+   * of each column — that the pages follow. See
+   * `SqliteConnectionFeatures.pagedReadSize`.
+   */
+  readonly primaryKeyIndex?: SqliteIndex;
   readonly options?: TableDataExportOptions;
   readonly signal?: AbortSignal;
   readonly onProgress?: DumpProgressCallback;

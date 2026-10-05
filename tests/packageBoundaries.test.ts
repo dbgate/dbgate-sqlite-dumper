@@ -157,4 +157,15 @@ describe('public API surface', () => {
       expect(adapter).toHaveProperty('connectBetterSqlite3');
     },
   );
+
+  it(
+    'exports the adapter functions from the Cloudflare D1 entry point',
+    { timeout: IMPORT_TIMEOUT },
+    async () => {
+      const adapter = await import('../src/d1.js');
+      expect(adapter).toHaveProperty('fromD1Http');
+      expect(adapter).toHaveProperty('fromD1Binding');
+      expect(adapter).toHaveProperty('d1ConnectionFeatures');
+    },
+  );
 });

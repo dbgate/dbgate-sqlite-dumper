@@ -32,7 +32,8 @@ export interface SqliteQuery {
  * `data/valueQuery.ts`), so a 64-bit integer or a `REAL`'s exact digits
  * never pass through a JavaScript number on the way into the dump.
  */
-export type SqliteColumnValue = string | number | bigint | Buffer | Uint8Array | null;
+export type SqliteColumnValue =
+  string | number | bigint | Buffer | Uint8Array | ArrayBuffer | readonly number[] | null;
 
 /** A single result row, keyed by column name. */
 export interface SqliteRow {
@@ -76,6 +77,63 @@ export interface SqliteErrorInfo {
 }
 
 /**
+ * What a connection can and cannot do, for engines that speak SQLite's SQL
+ * but are not an embedded SQLite handle — Cloudflare D1, reached over HTTP,
+ * is the case this exists for. Every field is optional and defaults to what
+ * an ordinary SQLite handle does, so a local adapter declares nothing.
+ *
+ * The dump honours each restriction by choosing a different but equivalent
+ * query, so the output is the same dump an ordinary handle onto the same
+ * database would produce.
+ */
+export interface SqliteConnectionFeatures {
+  /**
+   * `false` when the engine accepts no `BEGIN` / `SAVEPOINT`. A dump then
+   * reads without a snapshot (`consistency: 'none'`) and reports
+   * `snapshot-unavailable`. Defaults to `true`.
+   */
+  readonly transactions?: boolean;
+  /**
+   * `false` when the table-valued `pragma_xxx()` functions are refused; the
+   * catalog is then read through the `PRAGMA xxx(arg)` statements instead.
+   * Defaults to `true` (for SQLite 3.16+).
+   */
+  readonly pragmaFunctions?: boolean;
+  /**
+   * `false` when only the classic introspection pragmas are allowed:
+   * `table_info` / `index_info` in place of `table_xinfo` / `index_xinfo`,
+   * and no `table_list`. The dump is the same; what is lost is detail only a
+   * diagnostic uses (generated columns, index key order and collations).
+   * Defaults to `true`.
+   */
+  readonly extendedPragmas?: boolean;
+  /**
+   * `false` when statements must not name a schema (`"main"."t"`). Only the
+   * `main` schema can be dumped then. Defaults to `true`.
+   */
+  readonly schemaQualifiedNames?: boolean;
+  /**
+   * How binary values cross the connection. `'hex'` has SQLite return them
+   * as `hex()` text, for transports — such as JSON — that cannot carry bytes
+   * exactly. Defaults to `'native'`.
+   */
+  readonly binaryTransport?: 'native' | 'hex';
+  /**
+   * Read table data in pages of this many rows through {@link
+   * SqliteConnection.query} instead of {@link SqliteConnection.stream}, for
+   * engines that return a whole result at once. Pages are keyed on the rowid
+   * or the primary key, so each one is an index seek.
+   */
+  readonly pagedReadSize?: number;
+  /**
+   * Name prefixes of objects the engine keeps for itself in `sqlite_schema`
+   * and refuses to let a client read — D1's `_cf_` tables. They are left out
+   * of the dump. Compared case-insensitively.
+   */
+  readonly reservedNamePrefixes?: readonly string[];
+}
+
+/**
  * One open SQLite database handle.
  *
  * Implementations must serialize statements sent through the same handle.
@@ -85,10 +143,24 @@ export interface SqliteErrorInfo {
  * stepping.
  */
 export interface SqliteConnection {
+  /** Restrictions of the engine behind this handle; see {@link SqliteConnectionFeatures}. */
+  readonly features?: SqliteConnectionFeatures;
+
   query<Row extends SqliteRow = SqliteRow>(
     query: SqliteQuery,
     signal?: AbortSignal,
   ): Promise<SqliteQueryResult<Row>>;
+
+  /**
+   * Runs several read-only queries in one round trip, returning one result
+   * per query in order. Optional: introspection uses it, when present, to
+   * fetch the catalog of every table in a few requests instead of several
+   * per table. If a batch fails as a whole, its queries are run one by one.
+   */
+  queryBatch?(
+    queries: readonly SqliteQuery[],
+    signal?: AbortSignal,
+  ): Promise<readonly SqliteQueryResult[]>;
 
   /** Streams rows without buffering the full result set in memory. */
   stream<Row extends SqliteRow = SqliteRow>(

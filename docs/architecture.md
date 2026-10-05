@@ -38,6 +38,29 @@ SQLite is embedded, so a "connection" is one open database handle. The contract 
 shape of the network drivers' in the sibling packages — including `SqliteConnectionSource`
 for pool-like inputs — so an application can drive every dumper the same way.
 
+### Connection features: engines that are not a SQLite handle
+
+An adapter may declare `features` — restrictions of the engine behind it — and an optional
+`queryBatch()`. Cloudflare D1 (`src/d1.ts`) is why they exist: SQLite's SQL, reached over
+HTTP, behind an authorizer. Each feature makes the core choose an equivalent query rather
+than a different dump:
+
+- `transactions: false` — the session reads without a snapshot and says so
+  (`snapshot-unavailable`);
+- `pragmaFunctions: false` / `extendedPragmas: false` — the catalog is read through the
+  classic `PRAGMA` statements (the reader also falls back on its own the first time an
+  extended pragma is refused);
+- `schemaQualifiedNames: false` — no statement names a schema;
+- `binaryTransport: 'hex'` — text and blob bytes are selected as `hex()`;
+- `pagedReadSize` — table data is read through `query()` in pages keyed on the rowid or
+  the primary key, in natural scan order, instead of through `stream()`;
+- `reservedNamePrefixes` — objects the engine keeps for itself are left out, together
+  with their counters and statistics.
+
+`queryBatch()` lets introspection fetch every table's catalog in a few requests; a batch
+that fails is not fatal, its queries simply run one by one. The tests run every feature
+against an ordinary handle as well, where each must leave the dump byte-identical.
+
 ### Why one read transaction
 
 A dump runs entirely inside one transaction on one handle (`session.ts`), opened as a

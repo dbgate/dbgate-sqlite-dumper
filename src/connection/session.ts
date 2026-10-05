@@ -1,4 +1,4 @@
-import { executeStatement } from './acquire.js';
+import { connectionFeatures, executeStatement } from './acquire.js';
 import type { SqliteConnection } from './types.js';
 
 /**
@@ -28,6 +28,12 @@ export interface SqliteDumpSession {
    * uncommitted changes. Reported so a caller can tell.
    */
   readonly joinedExistingTransaction: boolean;
+  /**
+   * `true` when a snapshot was asked for but the engine has no transactions
+   * (see `SqliteConnectionFeatures.transactions`), so the session reads
+   * without one and {@link consistency} is `'none'`.
+   */
+  readonly snapshotUnavailable: boolean;
   /**
    * Ends the read transaction. Idempotent. Never throws for a handle that is
    * already closed — cleanup must not mask the error that caused it.
@@ -60,11 +66,14 @@ export async function beginSqliteDumpSession(
   options?: SqliteDumpSessionOptions,
   signal?: AbortSignal,
 ): Promise<SqliteDumpSession> {
-  const consistency = options?.consistency ?? 'snapshot';
+  const requested = options?.consistency ?? 'snapshot';
   const joinedExistingTransaction = connection.isInTransaction?.() ?? false;
+  const snapshotUnavailable =
+    requested === 'snapshot' && !connectionFeatures(connection).transactions;
+  const consistency: SqliteConsistencyMode = snapshotUnavailable ? 'none' : requested;
 
   if (consistency === 'none') {
-    return { consistency, joinedExistingTransaction, finish: async () => {} };
+    return { consistency, joinedExistingTransaction, snapshotUnavailable, finish: async () => {} };
   }
 
   await executeStatement(connection, `SAVEPOINT ${DUMP_SAVEPOINT}`, signal);
@@ -88,5 +97,5 @@ export async function beginSqliteDumpSession(
     throw error;
   }
 
-  return { consistency, joinedExistingTransaction, finish };
+  return { consistency, joinedExistingTransaction, snapshotUnavailable: false, finish };
 }
