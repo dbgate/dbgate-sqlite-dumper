@@ -1,7 +1,7 @@
 {
   "name": "dbgate-sqlite-dumper",
   "version": "0.1.0",
-  "description": "Standalone, client-agnostic SQLite SQL dump and restore library for Node.js, compatible with the native sqlite3 .dump command",
+  "description": "Standalone, client-agnostic SQLite SQL dump and restore library for Node.js, compatible with the native sqlite3 .dump command, with adapters for better-sqlite3 and Cloudflare D1",
   "type": "module",
   "license": "GPL-3.0-only",
   "repository": {
@@ -34,6 +34,11 @@
       "types": "./dist/better-sqlite3.d.ts",
       "import": "./dist/better-sqlite3.js",
       "require": "./dist/better-sqlite3.cjs"
+    },
+    "./d1": {
+      "types": "./dist/d1.d.ts",
+      "import": "./dist/d1.js",
+      "require": "./dist/d1.cjs"
     }
   },
   "scripts": {
@@ -59,7 +64,9 @@
     "backup",
     "restore",
     "database",
-    "better-sqlite3"
+    "better-sqlite3",
+    "cloudflare",
+    "d1"
   ],
   "sideEffects": false,
   "publishConfig": {

@@ -1,5 +1,6 @@
-import type { SqliteRow } from '../connection/types.js';
-import type { SqliteColumn, SqliteTable } from '../model/database.js';
+import { connectionFeatures, toBuffer } from '../connection/acquire.js';
+import type { SqliteConnection, SqliteRow } from '../connection/types.js';
+import type { SqliteColumn, SqliteIndex, SqliteTable } from '../model/database.js';
 import type { SqliteDiagnostic } from '../model/diagnostics.js';
 import {
   quoteIdentifier,
@@ -11,7 +12,8 @@ import { quoteStringLiteral } from '../security/literals.js';
 import { isAbortError, throwIfAborted } from '../utils/errors.js';
 import { SqlChunkBuilder } from './chunkBuilder.js';
 import type { TableDataExportRequest, TableDataExportResult } from './types.js';
-import { columnValueSelect, renderColumnLiteral } from './valueQuery.js';
+import { columnValueSelect, renderColumnLiteral, valueTransport } from './valueQuery.js';
+import type { SqliteValueTransport } from './valueQuery.js';
 
 const DEFAULT_MAX_STATEMENT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 500;
@@ -86,6 +88,8 @@ export async function exportTableDataAsInserts(
   );
   const textStyle = options.rawNewlines ? 'raw-newlines' : 'escaped';
   const utf8Database = (request.encoding ?? 'UTF-8').toUpperCase() === 'UTF-8';
+  const features = connectionFeatures(connection);
+  const transport = valueTransport(utf8Database, features.binaryTransport);
 
   const warnings: SqliteDiagnostic[] = [];
   const columns = insertableColumns(table);
@@ -127,13 +131,46 @@ export async function exportTableDataAsInserts(
   const statementPrefix = `INSERT INTO ${quoteIdentifierIfNeeded(table.name)}${columnList} VALUES`;
 
   const selectList = [
-    ...(rowidName ? [columnValueSelect(rowidName, 0, utf8Database)] : []),
+    ...(rowidName ? [columnValueSelect(rowidName, 0, utf8Database, transport)] : []),
     ...columns.map((column, index) =>
-      columnValueSelect(quoteIdentifier(column.name), index + (rowidName ? 1 : 0), utf8Database),
+      columnValueSelect(
+        quoteIdentifier(column.name),
+        index + (rowidName ? 1 : 0),
+        utf8Database,
+        transport,
+      ),
     ),
   ].join(', ');
   const valueCount = columns.length + (rowidName ? 1 : 0);
-  const sql = `SELECT ${selectList} FROM ${quoteQualifiedIdentifier(schemaName, table.name)}${systemRowFilterClause(table, request.systemRowFilter)}`;
+  const from = features.schemaQualifiedNames
+    ? quoteQualifiedIdentifier(schemaName, table.name)
+    : quoteIdentifier(table.name);
+  const filter = systemRowFilterCondition(
+    table,
+    request.systemRowFilter,
+    features.reservedNamePrefixes,
+  );
+  const rows =
+    features.pagedReadSize === undefined
+      ? connection.stream<SqliteRow>(
+          { sql: `SELECT ${selectList} FROM ${from}${filter === null ? '' : ` WHERE ${filter}`}` },
+          {
+            ...(signal === undefined ? {} : { signal }),
+            ...(options.streamBatchSize === undefined
+              ? {}
+              : { batchSize: options.streamBatchSize }),
+          },
+        )
+      : readPages({
+          connection,
+          selectList,
+          from,
+          filter,
+          pageSize: features.pagedReadSize,
+          key: pageKey(table, columns, rowidName ? 1 : 0, request.primaryKeyIndex),
+          transport,
+          signal,
+        });
 
   let rowsExported = 0;
   let statementsWritten = 0;
@@ -181,13 +218,7 @@ export async function exportTableDataAsInserts(
 
   progress('started');
   try {
-    for await (const row of connection.stream<SqliteRow>(
-      { sql },
-      {
-        ...(signal === undefined ? {} : { signal }),
-        ...(options.streamBatchSize === undefined ? {} : { batchSize: options.streamBatchSize }),
-      },
-    )) {
+    for await (const row of rows) {
       throwIfAborted(signal);
 
       const tuple = new SqlChunkBuilder();
@@ -196,7 +227,7 @@ export async function exportTableDataAsInserts(
         if (index > 0) {
           tuple.append(',');
         }
-        tuple.append(renderColumnLiteral(row, index, textStyle));
+        tuple.append(renderColumnLiteral(row, index, textStyle, transport));
       }
       tuple.append(')');
 
@@ -256,15 +287,210 @@ export async function exportTableDataAsInserts(
  * For a partial dump, restricts `sqlite_sequence` to the counters of the
  * dumped tables and `sqlite_stat*` to their statistics. Both key the row by
  * table name in their first column (`name` and `tbl` respectively).
+ *
+ * The rows of tables with a reserved name (see
+ * `SqliteConnectionFeatures.reservedNamePrefixes`) are always left out:
+ * those tables are not in the dump, so neither are their counters and
+ * statistics.
  */
-function systemRowFilterClause(table: SqliteTable, filter: readonly string[] | undefined): string {
-  if (filter === undefined || table.kind !== 'system') {
-    return '';
+function systemRowFilterCondition(
+  table: SqliteTable,
+  filter: readonly string[] | undefined,
+  reservedPrefixes: readonly string[],
+): string | null {
+  if (table.kind !== 'system' || (filter === undefined && reservedPrefixes.length === 0)) {
+    return null;
   }
   const column = table.name === 'sqlite_sequence' ? 'name' : 'tbl';
-  const names = [...new Set(filter.map(toAsciiLowerCase))].map(quoteStringLiteral);
-  if (names.length === 0) {
-    return ' WHERE 0';
+  const conditions: string[] = [];
+  if (filter !== undefined) {
+    const names = [...new Set(filter.map(toAsciiLowerCase))].map(quoteStringLiteral);
+    if (names.length === 0) {
+      return '0';
+    }
+    conditions.push(`lower(${column}) IN (${names.join(',')})`);
   }
-  return ` WHERE lower(${column}) IN (${names.join(',')})`;
+  for (const prefix of reservedPrefixes) {
+    const lower = toAsciiLowerCase(prefix);
+    conditions.push(
+      `coalesce(substr(lower(${column}), 1, ${lower.length}) <> ${quoteStringLiteral(lower)}, 1)`,
+    );
+  }
+  return conditions.join(' AND ');
+}
+
+/**
+ * How consecutive pages of a table are delimited:
+ *
+ * - `rowid` — by the rowid (or the column that aliases it), which every
+ *   ordinary table has: `WHERE rowid > :last ORDER BY rowid`, an index seek
+ *   per page in exactly the order an unordered scan returns.
+ * - `primaryKey` — by the primary key of a `WITHOUT ROWID` table, in the
+ *   order of its key index, which is again the natural scan order. The key of
+ *   the last row is written back as the literals this package renders for it.
+ * - `offset` — `LIMIT … OFFSET …` with no order, for what has neither: a
+ *   virtual table, or a table whose `rowid`, `_rowid_` and `oid` are all
+ *   shadowed by columns.
+ */
+type PageKey =
+  | { readonly kind: 'rowid'; readonly expression: string }
+  | {
+      readonly kind: 'primaryKey';
+      readonly columns: readonly {
+        readonly expression: string;
+        readonly valueIndex: number;
+        readonly descending: boolean;
+      }[];
+    }
+  | { readonly kind: 'offset' };
+
+function pageKey(
+  table: SqliteTable,
+  columns: readonly SqliteColumn[],
+  valueOffset: number,
+  primaryKeyIndex: SqliteIndex | undefined,
+): PageKey {
+  if (table.kind === 'virtual') {
+    return { kind: 'offset' };
+  }
+  if (!table.withoutRowid) {
+    if (table.rowidAliasColumn !== null) {
+      return { kind: 'rowid', expression: quoteIdentifier(table.rowidAliasColumn) };
+    }
+    const names = new Set(table.columns.map(column => toAsciiLowerCase(column.name)));
+    const name = ROWID_NAMES.find(candidate => !names.has(candidate));
+    return name === undefined ? { kind: 'offset' } : { kind: 'rowid', expression: name };
+  }
+  const valueIndexes = new Map(
+    columns.map((column, index) => [toAsciiLowerCase(column.name), index + valueOffset]),
+  );
+  // The key index lists the key in its own order, with direction and
+  // collation; without it (an engine that has no `index_xinfo`), the
+  // declared primary-key order, ascending, in each column's own collation.
+  const keyColumns =
+    primaryKeyIndex && primaryKeyIndex.columns.length > 0
+      ? primaryKeyIndex.columns.map(column => ({
+          name: column.name,
+          descending: column.descending,
+          collation: column.collation,
+        }))
+      : [...table.columns]
+          .filter(column => column.primaryKeyPosition > 0)
+          .sort((a, b) => a.primaryKeyPosition - b.primaryKeyPosition)
+          .map(column => ({ name: column.name, descending: false, collation: null }));
+  const result: { expression: string; valueIndex: number; descending: boolean }[] = [];
+  for (const column of keyColumns) {
+    const valueIndex =
+      column.name === null ? undefined : valueIndexes.get(toAsciiLowerCase(column.name));
+    if (column.name === null || valueIndex === undefined) {
+      return { kind: 'offset' };
+    }
+    const collation =
+      column.collation === null || toAsciiLowerCase(column.collation) === 'binary'
+        ? ''
+        : ` COLLATE ${quoteIdentifier(column.collation)}`;
+    result.push({
+      expression: `${quoteIdentifier(column.name)}${collation}`,
+      valueIndex,
+      descending: column.descending,
+    });
+  }
+  return result.length === 0 ? { kind: 'offset' } : { kind: 'primaryKey', columns: result };
+}
+
+/** Alias of the extra rowid column a `rowid`-keyed page selects. */
+const PAGE_KEY_ALIAS = 'dbgate_page_key';
+
+/** Reads a table page by page through `query()`; see {@link PageKey}. */
+async function* readPages(request: {
+  readonly connection: SqliteConnection;
+  readonly selectList: string;
+  readonly from: string;
+  readonly filter: string | null;
+  readonly pageSize: number;
+  readonly key: PageKey;
+  readonly transport: SqliteValueTransport;
+  readonly signal: AbortSignal | undefined;
+}): AsyncGenerator<SqliteRow> {
+  const { connection, selectList, from, filter, pageSize, key, transport, signal } = request;
+  let after: string | null = null;
+  let offset = 0;
+  for (;;) {
+    throwIfAborted(signal);
+    const conditions = [filter, after].filter(condition => condition !== null);
+    const where =
+      conditions.length === 0 ? '' : ` WHERE ${conditions.map(c => `(${c})`).join(' AND ')}`;
+    let sql: string;
+    if (key.kind === 'rowid') {
+      sql = `SELECT ${selectList}, CAST(${key.expression} AS TEXT) AS "${PAGE_KEY_ALIAS}" FROM ${from}${where} ORDER BY ${key.expression} LIMIT ${pageSize}`;
+    } else if (key.kind === 'primaryKey') {
+      const order = key.columns
+        .map(column => `${column.expression}${column.descending ? ' DESC' : ''}`)
+        .join(', ');
+      sql = `SELECT ${selectList} FROM ${from}${where} ORDER BY ${order} LIMIT ${pageSize}`;
+    } else {
+      sql = `SELECT ${selectList} FROM ${from}${where} LIMIT ${pageSize} OFFSET ${offset}`;
+    }
+    const { rows } = await connection.query<SqliteRow>({ sql }, signal);
+    for (const row of rows) {
+      yield row;
+    }
+    if (rows.length < pageSize) {
+      return;
+    }
+    const last = rows[rows.length - 1] as SqliteRow;
+    if (key.kind === 'rowid') {
+      after = `${key.expression} > ${String(last[PAGE_KEY_ALIAS])}`;
+    } else if (key.kind === 'primaryKey') {
+      after = keyAfterCondition(key.columns, last, transport);
+    } else {
+      offset += rows.length;
+    }
+  }
+}
+
+/**
+ * `key > last` in key-index order, expanded column by column
+ * (`a > x OR (a = x AND b > y) …`) so that each column compares in its own
+ * direction and collation.
+ */
+function keyAfterCondition(
+  columns: readonly {
+    readonly expression: string;
+    readonly valueIndex: number;
+    readonly descending: boolean;
+  }[],
+  row: SqliteRow,
+  transport: SqliteValueTransport,
+): string {
+  const literals = columns.map(column => keyLiteral(row, column.valueIndex, transport));
+  const alternatives: string[] = [];
+  for (let position = 0; position < columns.length; position++) {
+    const terms: string[] = [];
+    for (let previous = 0; previous < position; previous++) {
+      terms.push(
+        `${(columns[previous] as { expression: string }).expression} = ${literals[previous]}`,
+      );
+    }
+    const column = columns[position] as { expression: string; descending: boolean };
+    terms.push(`${column.expression} ${column.descending ? '<' : '>'} ${literals[position]}`);
+    alternatives.push(terms.length === 1 ? (terms[0] as string) : `(${terms.join(' AND ')})`);
+  }
+  return alternatives.join(' OR ');
+}
+
+/** A key value of the last row of a page, as a literal for the next page's condition. */
+function keyLiteral(row: SqliteRow, index: number, transport: SqliteValueTransport): string {
+  const literal = renderColumnLiteral(row, index, 'escaped', transport);
+  if (typeof literal === 'string') {
+    return literal;
+  }
+  // Text that is not valid UTF-8 is rendered as raw bytes; as a condition it
+  // is written as those bytes, cast back to text.
+  const value = row[`v${index}`] ?? null;
+  const bytes =
+    typeof value === 'string'
+      ? Buffer.from(value, transport.hexText ? 'hex' : 'utf8')
+      : toBuffer(value as Uint8Array | ArrayBuffer | readonly number[]);
+  return `CAST(X'${bytes.toString('hex').toUpperCase()}' AS TEXT)`;
 }

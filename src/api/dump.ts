@@ -92,6 +92,13 @@ export async function dumpSqlite(
       if (!table) {
         return false;
       }
+      const primaryKeyIndex = table.withoutRowid
+        ? introspection.database.indexes.find(
+            index =>
+              index.origin === 'pk' &&
+              foldSqliteName(index.tableName) === foldSqliteName(table.name),
+          )
+        : undefined;
       const result = await exportTableDataAsInserts({
         connection: acquired.connection,
         schemaName: introspection.database.schemaName,
@@ -99,6 +106,7 @@ export async function dumpSqlite(
         writer,
         encoding: introspection.database.encoding,
         ...(entry.systemRowFilter === undefined ? {} : { systemRowFilter: entry.systemRowFilter }),
+        ...(primaryKeyIndex === undefined ? {} : { primaryKeyIndex }),
         ...(options.dataExport === undefined ? {} : { options: options.dataExport }),
         ...(signal === undefined ? {} : { signal }),
         ...(onProgress === undefined ? {} : { onProgress }),
@@ -126,16 +134,23 @@ export async function dumpSqlite(
 
     onProgress?.({ phase: 'finalizing', bytesWritten: renderResult.bytesWritten });
 
-    const sessionWarnings: SqliteDiagnostic[] = session.joinedExistingTransaction
-      ? [
-          {
-            severity: 'info',
-            code: 'dump-joined-caller-transaction',
-            message:
-              "The connection was already inside a transaction, so the dump was read within it and includes that transaction's uncommitted changes.",
-          },
-        ]
-      : [];
+    const sessionWarnings: SqliteDiagnostic[] = [];
+    if (session.joinedExistingTransaction) {
+      sessionWarnings.push({
+        severity: 'info',
+        code: 'dump-joined-caller-transaction',
+        message:
+          "The connection was already inside a transaction, so the dump was read within it and includes that transaction's uncommitted changes.",
+      });
+    }
+    if (session.snapshotUnavailable) {
+      sessionWarnings.push({
+        severity: 'warning',
+        code: 'snapshot-unavailable',
+        message:
+          'The database does not support transactions, so the dump was not read from one snapshot: changes committed while it ran may be partly included.',
+      });
+    }
 
     return {
       bytesWritten: renderResult.bytesWritten,

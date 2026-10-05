@@ -1,6 +1,7 @@
 import type {
   AcquiredSqliteConnection,
   SqliteConnection,
+  SqliteConnectionFeatures,
   SqliteConnectionInput,
   SqliteExecResult,
 } from './types.js';
@@ -68,8 +69,54 @@ export function toText(value: unknown): string | null {
   if (typeof value === 'string') {
     return value;
   }
-  if (value instanceof Uint8Array) {
-    return Buffer.from(value).toString('utf8');
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer || Array.isArray(value)) {
+    return toBuffer(value as Uint8Array | ArrayBuffer | readonly number[]).toString('utf8');
   }
   return String(value);
+}
+
+/**
+ * Bytes as a `Buffer`, from any shape a driver returns them in: `Buffer`,
+ * `Uint8Array`, `ArrayBuffer` (libSQL), or an array of byte values (the
+ * JSON transport of Cloudflare D1).
+ */
+export function toBuffer(value: Uint8Array | ArrayBuffer | readonly number[]): Buffer {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+  return Buffer.from(value as number[]);
+}
+
+/** {@link SqliteConnectionFeatures} with every default filled in. */
+export interface ResolvedConnectionFeatures {
+  readonly transactions: boolean;
+  readonly pragmaFunctions: boolean;
+  readonly extendedPragmas: boolean;
+  readonly schemaQualifiedNames: boolean;
+  readonly binaryTransport: 'native' | 'hex';
+  readonly pagedReadSize: number | undefined;
+  readonly reservedNamePrefixes: readonly string[];
+}
+
+export function connectionFeatures(connection: SqliteConnection): ResolvedConnectionFeatures {
+  const features: SqliteConnectionFeatures = connection.features ?? {};
+  const pageSize = features.pagedReadSize;
+  return {
+    transactions: features.transactions ?? true,
+    pragmaFunctions: features.pragmaFunctions ?? true,
+    extendedPragmas: features.extendedPragmas ?? true,
+    schemaQualifiedNames: features.schemaQualifiedNames ?? true,
+    binaryTransport: features.binaryTransport ?? 'native',
+    pagedReadSize:
+      pageSize === undefined || !Number.isFinite(pageSize)
+        ? undefined
+        : Math.max(1, Math.floor(pageSize)),
+    reservedNamePrefixes: features.reservedNamePrefixes ?? [],
+  };
 }

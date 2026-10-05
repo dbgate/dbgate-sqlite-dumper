@@ -1,5 +1,6 @@
-import { toNumber, toText } from '../connection/acquire.js';
-import type { SqliteConnection, SqliteRow } from '../connection/types.js';
+import { connectionFeatures, toNumber, toText } from '../connection/acquire.js';
+import type { ResolvedConnectionFeatures } from '../connection/acquire.js';
+import type { SqliteConnection, SqliteQuery, SqliteRow } from '../connection/types.js';
 import type {
   SqliteColumn,
   SqliteColumnHidden,
@@ -56,6 +57,9 @@ interface SchemaRow {
  * to the plain `PRAGMA` statements otherwise.
  *
  * Runs entirely on the one handle it is given, in sequence, and never writes.
+ * A handle that declares {@link SqliteConnection.features} restrictions is
+ * read with the equivalent queries it does allow; one that has
+ * {@link SqliteConnection.queryBatch} gets the per-table catalog in batches.
  */
 export async function introspectSqlite(
   connection: SqliteConnection,
@@ -65,21 +69,39 @@ export async function introspectSqlite(
   const schemaName = options?.schemaName ?? 'main';
   const version = await detectSqliteVersion(connection, signal);
   const capabilities = detectSqliteCapabilities(version);
+  const features = connectionFeatures(connection);
   const diagnostics: SqliteDiagnostic[] = [];
-  const catalog = new CatalogReader(connection, schemaName, capabilities, signal);
+  if (!features.schemaQualifiedNames && toAsciiLowerCase(schemaName) !== 'main') {
+    throw new SqliteDumperError(
+      'schema-not-found',
+      `This connection can only read the main database, not ${JSON.stringify(schemaName)}`,
+    );
+  }
+  const catalog = new CatalogReader(connection, schemaName, capabilities, features, signal);
 
-  const schemaRows = await catalog.schemaRows();
-  if (schemaRows === null) {
+  const allSchemaRows = await catalog.schemaRows();
+  if (allSchemaRows === null) {
     throw new SqliteDumperError(
       'schema-not-found',
       `No database named ${JSON.stringify(schemaName)} is attached to this connection`,
     );
+  }
+  const reserved = allSchemaRows.filter(row => isReservedRow(row, features.reservedNamePrefixes));
+  const schemaRows = allSchemaRows.filter(row => !reserved.includes(row));
+  if (reserved.length > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'reserved-objects-skipped',
+      message: `Left out ${reserved.length} object${reserved.length === 1 ? '' : 's'} the database engine reserves for itself and does not let clients read: ${reserved.map(row => JSON.stringify(row.name)).join(', ')}.`,
+    });
   }
 
   const tableList = await catalog.tableList();
   const virtualTableNames = schemaRows
     .filter(row => row.type === 'table' && isVirtualTableSql(row.sql))
     .map(row => row.name);
+
+  await catalog.prefetch(schemaRows);
 
   const tables: SqliteTable[] = [];
   const indexes: SqliteIndex[] = [];
@@ -212,6 +234,25 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Whether a `sqlite_schema` row is, or belongs to, an object named with a reserved prefix. */
+function isReservedRow(row: SchemaRow, prefixes: readonly string[]): boolean {
+  if (prefixes.length === 0) {
+    return false;
+  }
+  const names = [toAsciiLowerCase(row.name), toAsciiLowerCase(row.tableName)];
+  return prefixes.some(prefix => {
+    const lower = toAsciiLowerCase(prefix);
+    return names.some(name => name.startsWith(lower));
+  });
+}
+
+/** Queries per request handed to {@link SqliteConnection.queryBatch}. */
+const PREFETCH_BATCH_SIZE = 50;
+
+function queryKey(query: SqliteQuery): string {
+  return `${query.sql}\u0000${JSON.stringify(query.parameters ?? [])}`;
+}
+
 function isVirtualTableSql(sql: string | null): boolean {
   // The native shell tests exactly this prefix (`strncmp`, case-sensitive);
   // SQLite normalizes the start of every stored CREATE statement, so it is
@@ -285,52 +326,157 @@ interface ListedTable {
 
 /** Catalog queries for one schema, using the pragma functions when available. */
 class CatalogReader {
+  /** `"schema".`, or empty for a connection that cannot qualify names. */
   private readonly qualifier: string;
+  private readonly usePragmaFunctions: boolean;
+  // Not readonly: an engine that refuses the extended pragmas outright (some
+  // remote engines allow only the classic ones) is switched to the classic
+  // ones the first time one of them succeeds where its extended form failed.
+  private useTableXinfo: boolean;
+  private useIndexXinfo: boolean;
+  private readonly prefetched = new Map<string, readonly SqliteRow[]>();
 
   constructor(
     private readonly connection: SqliteConnection,
     private readonly schemaName: string,
     private readonly capabilities: SqliteCapabilities,
+    private readonly features: ResolvedConnectionFeatures,
     private readonly signal?: AbortSignal,
   ) {
-    this.qualifier = quoteIdentifier(schemaName);
+    this.qualifier = features.schemaQualifiedNames ? `${quoteIdentifier(schemaName)}.` : '';
+    this.usePragmaFunctions = capabilities.supportsPragmaFunctions && features.pragmaFunctions;
+    this.useTableXinfo = capabilities.supportsTableXinfo && features.extendedPragmas;
+    this.useIndexXinfo = features.extendedPragmas;
   }
 
   private async rows(
     sql: string,
     parameters?: readonly (string | number)[],
   ): Promise<readonly SqliteRow[]> {
-    const result = await this.connection.query<SqliteRow>(
-      parameters === undefined ? { sql } : { sql, parameters },
-      this.signal,
-    );
+    return this.run(parameters === undefined ? { sql } : { sql, parameters });
+  }
+
+  private async run(query: SqliteQuery): Promise<readonly SqliteRow[]> {
+    const prefetched = this.prefetched.get(queryKey(query));
+    if (prefetched !== undefined) {
+      return prefetched;
+    }
+    const result = await this.connection.query<SqliteRow>(query, this.signal);
     return result.rows;
   }
 
-  /** Runs `PRAGMA schema.name(argument)`, as a table-valued function when the library has them. */
-  private async pragma(
-    name: string,
-    argument: string,
-    columns: string,
-  ): Promise<readonly SqliteRow[]> {
-    if (this.capabilities.supportsPragmaFunctions) {
-      return this.rows(`SELECT ${columns} FROM pragma_${name}(?, ?)`, [argument, this.schemaName]);
+  /** `PRAGMA schema.name(argument)`, as a table-valued function when the library has them. */
+  private pragmaQuery(name: string, argument: string, columns: string): SqliteQuery {
+    if (this.usePragmaFunctions) {
+      return {
+        sql: `SELECT ${columns} FROM pragma_${name}(?, ?)`,
+        parameters: [argument, this.schemaName],
+      };
     }
-    return this.rows(`PRAGMA ${this.qualifier}.${name}(${quoteStringLiteral(argument)})`);
+    return { sql: `PRAGMA ${this.qualifier}${name}(${quoteStringLiteral(argument)})` };
+  }
+
+  private columnsQuery(tableName: string): SqliteQuery {
+    const withHidden = this.useTableXinfo;
+    return this.pragmaQuery(
+      withHidden ? 'table_xinfo' : 'table_info',
+      tableName,
+      `cid, name, type, "notnull" AS isNotNull, dflt_value AS defaultValue, pk${withHidden ? ', hidden' : ''}`,
+    );
+  }
+
+  private indexListQuery(tableName: string): SqliteQuery {
+    return this.pragmaQuery(
+      'index_list',
+      tableName,
+      'seq, name, "unique" AS isUnique, origin, partial',
+    );
+  }
+
+  private indexColumnsQuery(indexName: string): SqliteQuery {
+    return this.useIndexXinfo
+      ? this.pragmaQuery(
+          'index_xinfo',
+          indexName,
+          'seqno, cid, name, "desc" AS isDesc, coll, "key" AS isKey',
+        )
+      : this.pragmaQuery('index_info', indexName, 'seqno, cid, name');
+  }
+
+  private foreignKeysQuery(tableName: string): SqliteQuery {
+    return this.pragmaQuery(
+      'foreign_key_list',
+      tableName,
+      'id, seq, "table" AS referencedTable, "from" AS fromColumn, "to" AS toColumn, on_update AS onUpdate, on_delete AS onDelete, "match" AS matchMode',
+    );
+  }
+
+  /**
+   * Fetches the per-table catalog of every object up front through
+   * {@link SqliteConnection.queryBatch}, when the connection has it — for a
+   * remote engine, a few requests instead of several per table. A batch that
+   * fails is simply not cached: its queries then run one by one later, where
+   * a failing one is handled (or reported) as it would be without batching.
+   */
+  async prefetch(schemaRows: readonly SchemaRow[]): Promise<void> {
+    if (!this.connection.queryBatch) {
+      return;
+    }
+    const queries: SqliteQuery[] = [];
+    for (const row of schemaRows) {
+      if (row.type === 'table' && row.sql !== null) {
+        queries.push(this.columnsQuery(row.name));
+        if (!isVirtualTableSql(row.sql)) {
+          queries.push(this.indexListQuery(row.name), this.foreignKeysQuery(row.name));
+        }
+      } else if (row.type === 'index') {
+        queries.push(this.indexColumnsQuery(row.name));
+      }
+    }
+    for (let start = 0; start < queries.length; start += PREFETCH_BATCH_SIZE) {
+      throwIfAborted(this.signal);
+      const batch = queries.slice(start, start + PREFETCH_BATCH_SIZE);
+      let results;
+      try {
+        results = await this.connection.queryBatch(batch, this.signal);
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        continue;
+      }
+      if (results.length !== batch.length) {
+        continue;
+      }
+      batch.forEach((query, index) => {
+        this.prefetched.set(
+          queryKey(query),
+          (results[index] as { rows: readonly SqliteRow[] }).rows,
+        );
+      });
+    }
   }
 
   async schemaRows(): Promise<SchemaRow[] | null> {
-    const databases = await this.rows('PRAGMA database_list');
-    const known = databases.some(
-      row => toAsciiLowerCase(toText(row.name) ?? '') === toAsciiLowerCase(this.schemaName),
-    );
-    if (!known) {
-      return null;
+    if (this.features.schemaQualifiedNames) {
+      let databases: readonly SqliteRow[] | undefined;
+      try {
+        databases = await this.rows('PRAGMA database_list');
+      } catch (error) {
+        // An engine that refuses the pragma still has a main database.
+        if (isAbortError(error) || toAsciiLowerCase(this.schemaName) !== 'main') throw error;
+      }
+      const known =
+        databases === undefined ||
+        databases.some(
+          row => toAsciiLowerCase(toText(row.name) ?? '') === toAsciiLowerCase(this.schemaName),
+        );
+      if (!known) {
+        return null;
+      }
     }
     const master =
       toAsciiLowerCase(this.schemaName) === 'temp' ? 'sqlite_temp_master' : 'sqlite_master';
     const rows = await this.rows(
-      `SELECT rowid AS schemaRowid, type, name, tbl_name AS tableName, sql FROM ${this.qualifier}.${master} ORDER BY rowid`,
+      `SELECT rowid AS schemaRowid, type, name, tbl_name AS tableName, sql FROM ${this.qualifier}${master} ORDER BY rowid`,
     );
     return rows.map(row => ({
       schemaRowid: toNumber(row.schemaRowid),
@@ -342,14 +488,19 @@ class CatalogReader {
   }
 
   async tableList(): Promise<Map<string, ListedTable> | undefined> {
-    if (!this.capabilities.supportsTableList) {
+    if (!this.capabilities.supportsTableList || !this.features.extendedPragmas) {
       return undefined;
     }
     try {
-      const rows = await this.rows(
-        'SELECT name, type, wr, strict FROM pragma_table_list WHERE schema = ?',
-        [this.schemaName],
-      );
+      const rows = this.usePragmaFunctions
+        ? await this.rows('SELECT name, type, wr, strict FROM pragma_table_list WHERE schema = ?', [
+            this.schemaName,
+          ])
+        : (await this.rows(`PRAGMA ${this.qualifier}table_list`)).filter(
+            row =>
+              !this.features.schemaQualifiedNames ||
+              toAsciiLowerCase(toText(row.schema) ?? '') === toAsciiLowerCase(this.schemaName),
+          );
       return new Map(
         rows.map(row => [
           toAsciiLowerCase(toText(row.name) ?? ''),
@@ -369,13 +520,33 @@ class CatalogReader {
     }
   }
 
+  /** Runs an extended pragma's query, retrying it in its classic form if the engine refuses it. */
+  private async runExtended(
+    flag: 'useTableXinfo' | 'useIndexXinfo',
+    query: () => SqliteQuery,
+  ): Promise<readonly SqliteRow[]> {
+    try {
+      return await this.run(query());
+    } catch (error) {
+      if (isAbortError(error) || !this[flag]) throw error;
+      this[flag] = false;
+      try {
+        return await this.run(query());
+      } catch {
+        // The classic form fails too, so the extended one was not the
+        // problem (a virtual table whose module is missing, say).
+        this[flag] = true;
+        throw error;
+      }
+    }
+  }
+
   async columns(tableName: string): Promise<SqliteColumn[]> {
-    const withHidden = this.capabilities.supportsTableXinfo;
-    const rows = await this.pragma(
-      withHidden ? 'table_xinfo' : 'table_info',
-      tableName,
-      `cid, name, type, "notnull" AS isNotNull, dflt_value AS defaultValue, pk${withHidden ? ', hidden' : ''}`,
-    );
+    let withHidden = this.useTableXinfo;
+    const rows = await this.runExtended('useTableXinfo', () => {
+      withHidden = this.useTableXinfo;
+      return this.columnsQuery(tableName);
+    });
     return rows.map(row => {
       const hidden = (withHidden ? toNumber(row.hidden) : 0) as SqliteColumnHidden;
       return {
@@ -395,11 +566,7 @@ class CatalogReader {
     tableName: string,
     schemaRows: ReadonlyMap<string, SchemaRow>,
   ): Promise<SqliteIndex[]> {
-    const list = await this.pragma(
-      'index_list',
-      tableName,
-      'seq, name, "unique" AS isUnique, origin, partial',
-    );
+    const list = await this.run(this.indexListQuery(tableName));
     const result: SqliteIndex[] = [];
     for (const row of list) {
       const name = toText(row.name) ?? '';
@@ -407,13 +574,14 @@ class CatalogReader {
       const origin = (toText(row.origin) ?? 'c') as SqliteIndex['origin'];
       let columns: SqliteIndexColumn[] = [];
       try {
-        const keyRows = await this.pragma(
-          'index_xinfo',
-          name,
-          'seqno, cid, name, "desc" AS isDesc, coll, "key" AS isKey',
-        );
+        const keyRows = await this.runExtended('useIndexXinfo', () => this.indexColumnsQuery(name));
         columns = keyRows
-          .filter(keyRow => toNumber(keyRow.isKey ?? keyRow.key) !== 0)
+          // `index_info` lists only the key columns, and has no `key` column.
+          .filter(keyRow => {
+            const isKey = keyRow.isKey ?? keyRow.key;
+            return isKey === undefined || toNumber(isKey) !== 0;
+          })
+          .sort((a, b) => toNumber(a.seqno) - toNumber(b.seqno))
           .map(keyRow => ({
             name: toText(keyRow.name),
             cid: toNumber(keyRow.cid),
@@ -440,11 +608,7 @@ class CatalogReader {
   }
 
   async foreignKeys(tableName: string): Promise<SqliteForeignKey[]> {
-    const rows = await this.pragma(
-      'foreign_key_list',
-      tableName,
-      'id, seq, "table" AS referencedTable, "from" AS fromColumn, "to" AS toColumn, on_update AS onUpdate, on_delete AS onDelete, "match" AS matchMode',
-    );
+    const rows = await this.run(this.foreignKeysQuery(tableName));
     const byId = new Map<
       number,
       SqliteForeignKey & { columns: { from: string; to: string | null }[] }
@@ -477,7 +641,7 @@ class CatalogReader {
 
   async sequences(): Promise<SqliteSequence[]> {
     const rows = await this.rows(
-      `SELECT name, CAST(seq AS TEXT) AS value FROM ${this.qualifier}.sqlite_sequence`,
+      `SELECT name, CAST(seq AS TEXT) AS value FROM ${this.qualifier}sqlite_sequence`,
     );
     return rows.map(row => ({
       tableName: toText(row.name) ?? '',
@@ -490,7 +654,7 @@ class CatalogReader {
   > {
     const read = async (pragma: string): Promise<unknown> => {
       try {
-        const rows = await this.rows(`PRAGMA ${this.qualifier}.${pragma}`);
+        const rows = await this.rows(`PRAGMA ${this.qualifier}${pragma}`);
         const first = rows[0];
         return first === undefined ? undefined : Object.values(first)[0];
       } catch (error) {

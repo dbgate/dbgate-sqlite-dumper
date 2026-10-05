@@ -11,6 +11,9 @@ DbGate internals and works outside DbGate.
 - `better-sqlite3` is an **optional** peer dependency, reachable only through the
   separate `dbgate-sqlite-dumper/better-sqlite3` entry point — the core never
   imports a driver
+- **Cloudflare D1** too: `dbgate-sqlite-dumper/d1` dumps a D1 database over the REST API
+  (or a Worker binding) into the same native-compatible file — see
+  [docs/d1-adapter.md](docs/d1-adapter.md)
 - Streaming both ways: a multi-gigabyte database dumps, and a multi-gigabyte `.sql`
   file restores, in constant memory
 
@@ -129,6 +132,18 @@ A database you supply is **borrowed and never closed**. See
 [docs/better-sqlite3-adapter.md](docs/better-sqlite3-adapter.md); any other driver works by
 implementing the small `SqliteConnection` interface.
 
+### Cloudflare D1
+
+```ts
+import { fromD1Http } from 'dbgate-sqlite-dumper/d1';
+
+const connection = fromD1Http({ accountId, databaseId, apiToken });
+await dumpSqlite(connection, {}, fs.createWriteStream('backup.sql'));
+```
+
+Dump only, and not from a snapshot (D1 has no client transactions); see
+[docs/d1-adapter.md](docs/d1-adapter.md).
+
 ## Public API
 
 | Function                                                               | Purpose                                                            |
@@ -147,6 +162,7 @@ implementing the small `SqliteConnection` interface.
 | `checkTargetCompatibility(database, target)`                           | Which features a target cannot accept                              |
 | `fromBetterSqlite3(database)`                                          | Adapter (from `dbgate-sqlite-dumper/better-sqlite3`)               |
 | `connectBetterSqlite3(filename, options?)`                             | Convenience opener (from `dbgate-sqlite-dumper/better-sqlite3`)    |
+| `fromD1Http(options)` / `fromD1Binding(env.DB)`                        | Cloudflare D1 adapters (from `dbgate-sqlite-dumper/d1`)            |
 
 Each stage is independently usable: `inspectDumpArchive` and `renderPlainSql` are pure
 functions of the model and need no connection at all.
@@ -188,6 +204,7 @@ through both the shell and this package, which must leave identical databases.
 | [docs/dump-api.md](docs/dump-api.md)                             | `dumpSqlite` options, modes, consistency, progress, batching     |
 | [docs/restore-api.md](docs/restore-api.md)                       | `restoreSqlDump`, the parser, session cleanup, errors, preflight |
 | [docs/better-sqlite3-adapter.md](docs/better-sqlite3-adapter.md) | Ownership, defensive mode, the `SqliteConnection` contract       |
+| [docs/d1-adapter.md](docs/d1-adapter.md)                         | Dumping Cloudflare D1: REST API, Worker binding, restrictions    |
 | [docs/supported-objects.md](docs/supported-objects.md)           | Object matrix: dumped / restored / round-trip tested             |
 | [docs/supported-data-types.md](docs/supported-data-types.md)     | Per-storage-class fidelity and how each value is written         |
 | [docs/known-limitations.md](docs/known-limitations.md)           | What this package does not do, and why                           |
